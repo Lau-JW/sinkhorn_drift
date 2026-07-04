@@ -1,0 +1,35 @@
+.#*
+*~
+*.pyc
+__pycache__/
+.ipynb_checkpoints/
+.DS_Store
+.env
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Training outputs
+runs/
+logs/
+checkpoints/
+*.pt
+*.pth
+ckpt_*.pt
+
+# Data
+*.npy
+*.npz
+.zip
+*.msgpack
+*.safetensors
+
+# IDE
+.idea/
+.vscode/
+.vs/
+
+# JAX/TPU specific
+*.py.toml
