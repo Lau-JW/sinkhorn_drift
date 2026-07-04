@@ -1,396 +1,240 @@
 # Sinkhorn-Drifting Generative Models
+
+Official code for the ImageNet-256 experiments of **Drifting with Sinkhorn Coupling**.
+
+This repository extends [Generative Modeling via Drifting](https://arxiv.org/abs/2602.04770) (Deng et al., 2026) with **Sinkhorn optimal transport couplings** for the drift loss, while fully aligning the architecture and training hyperparameters with the original paper's JAX release.
+
+## Architecture: LightningDiT (aligned with Drifting)
+
+The DiT implementation (`imagenet/dit.py`) is a PyTorch port of Drifting's **LightningDiT**, with identical components:
+
+| Component | Drifting (JAX) | This repo (PyTorch) |
+|-----------|---------------|-------------------|
+| **Attention** | QK-Norm + RoPE | ✅ QK-Norm + RoPE |
+| **FFN** | SwiGLU | ✅ SwiGLU |
+| **Normalization** | RMSNorm | ✅ RMSNorm |
+| **Pos Embed** | 2D sincos | ✅ 2D sincos |
+| **Class Tokens** | 16 cls tokens | ✅ 16 cls tokens |
+| **Conditioning** | class + noise + CFG | ✅ class + noise + CFG |
+| **Noise Embed** | 64 classes × 32 coords | ✅ 64 × 32 |
+| **CFG Embed** | TimestepEmbedder + RMSNorm × 0.02 | ✅ same |
+| **AdaLN Zero Init** | ✅ | ✅ |
+
+### Two Conditioning Modes
+
+- **"drift" mode** (default): `cond = y_embed(y) + Σnoise_embed_i(nl_i) + cfg_norm(cfg_embed(cfg)) × 0.02`
+- **"flow" mode** (backward compat): `cond = t_embed(t) + h_embed(h) + y_embed(y)`
+
+## ImageNet-256 Training
+
+### Environment Setup
+
+```bash
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+pip install pytorch-fid diffusers tensorboard numpy scipy tqdm einops
+```
+
+### Data Preparation
+
+Download ImageNet-1k and precompute VAE latents. The dataset should be organized as a `.npy` file:
+
+```
+/path/to/imagenet256/cache_full/
+├── train_latents.npy    # (N, 4, 32, 32) float32
+├── train_labels.npy     # (N,) int64
+├── meta.json
+```
+
+Copy the numpy cache from the official Drifting JAX release or encode with SD-VAE.
+
+### Training: Ablation (DiT-B/2, ~134M params, 30k steps)
+
+This matches Drifting's ablation setting (`configs/gen/latent_ablation.yaml`):
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+HF_ENDPOINT=https://hf-mirror.com \
+torchrun --standalone --nproc_per_node=4 \
+    -m imagenet.train_drifting \
+    --cache-dir /path/to/imagenet256/cache_full \
+    --backbone dit_b_2 \
+    --coupling sinkhorn \
+    --drift-form split \
+    --sinkhorn-iters 20 \
+    --sinkhorn-marginal weighted_cols \
+    --temps 0.02 0.05 0.2 \
+    --nneg 64 --npos 64 --nuncond 16 \
+    --classes-per-step 64 \
+    --epochs 96 --lr 2e-4 --weight-decay 0.01 --warmup-steps 5000 --ema-decay 0.999 \
+    --noise-classes 64 --noise-coords 32 \
+    --feature-mode encoder --encoder-every-n-blocks 2 --gen-mode direct \
+    --run-name my_drift_exp \
+    --sample-every-epochs 0.5 --decode-rgb-every-epochs 0.5 \
+    --fid-every-epochs 5 --fid-num-samples 10000 \
+    --fid-ref-stats /path/to/imagenet_256_fid_stats.npz \
+    --tensorboard
+```
+
+**Training hyperparameters (aligned with Drifting ablation):**
+
+| Parameter | Value | Equivalent in Drifting |
+|-----------|-------|----------------------|
+| `--classes-per-step` | 64 | `train_batch_size: 64` |
+| `--nneg` | 64 | `gen_per_label: 64` |
+| `--npos` | 64 | `pos_per_sample: 64` |
+| `--nuncond` | 16 | `neg_per_sample: 16` |
+| `--lr` | 2e-4 | `learning_rate: 0.0002` |
+| `--weight-decay` | 0.01 | `weight_decay: 0.01` |
+| `--warmup-steps` | 5000 | `warmup_steps: 5000` |
+| `--ema-decay` | 0.999 | `ema_decay: 0.999` |
+| `--temps` | 0.02, 0.05, 0.2 | `R_list: [0.02, 0.05, 0.2]` |
+| `--epochs 96` | ~30048 steps | `total_steps: 30000` |
+| `--noise-classes 64 --noise-coords 32` | noise diversity | `noise_classes: 64, noise_coords: 32` |
+
+### Training: SOTA-L (~310M params, 200k steps)
+
+To match Drifting's SOTA-L setting (`configs/gen/latent_sota_L.yaml`), use `dit_l_2` backbone:
+
+```bash
+# 4× GPU (adjust classes-per-step for your GPU count)
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+HF_ENDPOINT=https://hf-mirror.com \
+torchrun --standalone --nproc_per_node=4 \
+    -m imagenet.train_drifting \
+    --cache-dir /path/to/imagenet256/cache_full \
+    --backbone dit_l_2 \
+    --coupling sinkhorn \
+    --drift-form split \
+    --sinkhorn-iters 20 \
+    --sinkhorn-marginal weighted_cols \
+    --temps 0.02 0.05 0.2 \
+    --nneg 64 --npos 64 --nuncond 32 \
+    --classes-per-step 32 \
+    --epochs 640 --lr 4e-4 --weight-decay 0.01 --warmup-steps 10000 --ema-decay 0.999 \
+    --noise-classes 64 --noise-coords 32 \
+    --feature-mode encoder --encoder-every-n-blocks 2 --gen-mode direct \
+    --run-name my_sotaL_exp \
+    --sample-every-epochs 1 --decode-rgb-every-epochs 1 \
+    --fid-every-epochs 5 --fid-num-samples 10000 \
+    --fid-ref-stats /path/to/imagenet_256_fid_stats.npz \
+    --tensorboard
+```
+
+**SOTA-L hyperparameters (aligned with Drifting SOTA-L):**
+
+| Parameter | Value | Equivalent in Drifting SOTA-L |
+|-----------|-------|------------------------------|
+| `--backbone` | `dit_l_2` | `hidden_size: 1024, depth: 24` |
+| `--classes-per-step` | 32 | `train_batch_size: 128` (adjust for GPU count) |
+| `--nneg` | 64 | `gen_per_label: 64` |
+| `--npos` | 64 | `pos_per_sample: 64` |
+| `--nuncond` | 32 | `neg_per_sample: 32` |
+| `--lr` | 4e-4 | `learning_rate: 0.0004` |
+| `--warmup-steps` | 10000 | `warmup_steps: 10000` |
+| `--epochs 640` | ~200,000 steps | `total_steps: 200000` |
+| `--fid-every-epochs 5` | eval every 5 epochs | `eval_per_step: ~1562` |
+
+### Model Size Comparison
+
+| Model | Params | Depth | Hidden | Heads | Tokens |
+|-------|--------|-------|--------|-------|--------|
+| DiT-S/2 | ~33M | 12 | 384 | 6 | 256 |
+| **DiT-B/2** (ablation) | **~134M** | **12** | **768** | **12** | **256** |
+| **DiT-L/2** (SOTA) | **~310M** | **24** | **1024** | **16** | **256** |
+| DiT-XL/2 | ~675M | 28 | 1152 | 16 | 256 |
+
+### CFG Sampling (Drifting-aligned)
+
+The training uses **uniform CFG sampling** (matching Drifting), not power-law:
+
+```python
+# During each training step:
+# 50%: cfg_scale = 1.0 (unconditional, dropout)
+# 50%: cfg_scale ~ Uniform[1.0, 4.0]
+_raw = 1.0 + torch.rand(classes_per_step) * 3.0
+_drop = torch.rand(classes_per_step) < 0.5
+omegas = torch.where(_drop, torch.ones_like(_raw), _raw)
+```
+
+This replaces the previous power-law sampling (`sample_power_law_omega` with exponent=3.0).
+
+### Logging and Monitoring
+
+- **TensorBoard**: Metrics (loss, grad_norm, FID) + generated RGB samples
+- **Periodic samples**: `samples_rgb_epochN_stepM.png` — real vs generated side-by-side
+- **Checkpoints**: Saved every epoch in `runs/imagenet256_drift/<run_name>/`
+
+### FID Evaluation
+
+Requires `pytorch-fid` and a reference `.npz` file:
+
+```bash
+pip install pytorch-fid
+# Download reference: https://drive.google.com/drive/folders/1Tr_6PXF2WMYkSlCbbkP_0FRhEjAXx5gb
+```
+
+The training script evaluates FID periodically (set by `--fid-every-epochs`) and at the end.
+
+---
+
+## Sinkhorn-specific Improvements
+
+Beyond Drifting's baseline, this codebase adds:
+
+| Improvement | Description |
+|-------------|-------------|
+| **Sinkhorn coupling** | Full optimal transport balancing (vs. partial two-sided heuristic) |
+| **Split drift form** | Decoupled positive/negative couplings (vs. joint) |
+| **Unconditional negatives** | Real uniform random samples as negatives (vs. memory bank) |
+| **Weighted column marginals** | CFG weighting via sinkhorn marginals (vs. kernel bias) |
+| **Configurable coupling** | `partial_two_sided`, `row`, or `sinkhorn` |
+| **Multi-temperature aggregation** | Configurable ρ values, feature normalization |
+
 ---
 
 ## Codebase Structure
 
 ```
-sinkhorn_paper_code/
-├── core/                  # Shared drifting loss (Baseline + Sinkhorn)
-│   ├── drifting_loss.py
-│   └── models/ema.py
-├── toy/                   # Toy example experiments (Section 5.2)
-│   ├── Gen_Modeling.py
-│   └── plot_w2_meanstd.py
-├── mnist/                 # MNIST experiments (Section 5.3)
-│   ├── models.py
-│   ├── train_ae.py
-│   ├── encode_latents.py
-│   ├── train_drifting.py
-│   ├── eval_emd.py
-│   ├── eval_acc.py
-│   └── make_figure.py
-└── ffhq/                  # FFHQ image generation experiments (Section 5.4)
-    ├── drift_ffhq.py
-    ├── eval_ckpt_fid_emd.py
-    └── fid_score.py
-```
-
-## Toy Experiments (Section 5.2)
-
-```bash
-python toy/Gen_Modeling.py \
-  --targets 8-Gaussians,Checkerboard \
-  --methods one-sided,two-sided,sinkhorn \
-  --eps-list 0.01,0.05,0.1 \
-  --drift-impl log \
-  --dist-metric l2_sq \
-  --sinkhorn-iters 20 \
-  --hidden 256 --blocks 6 --dim-in 16 \
-  --res-scale 0.9 --out-init-std 0.001 \
-  --batch-size 1024 \
-  --lr 2e-4 \
-  --steps 5000 \
-  --eval-every 100 --eval-n 1000 \
-  --device cuda:0
-```
-
-This command reproduces the main toy comparison used for Section 5.2 with the
-Gaussian kernel (`dist_metric=l2_sq`) and saves:
-
-- per-eps generated-vs-target scatter grids
-- per-eps `W_2^2` curves
-- per-eps combined figures
-- final model checkpoints under the run directory
-
-To aggregate `W_2^2` over 5 random seeds:
-
-```bash
-for SEED in 42 43 44 45 46; do
-  python toy/Gen_Modeling.py \
-    --targets 8-Gaussians,Checkerboard \
-    --methods one-sided,two-sided,sinkhorn \
-    --eps-list 0.01,0.05,0.1 \
-    --drift-impl log \
-    --dist-metric l2_sq \
-    --sinkhorn-iters 20 \
-    --hidden 256 --blocks 6 --dim-in 16 \
-    --res-scale 0.9 --out-init-std 0.001 \
-    --batch-size 1024 \
-    --lr 2e-4 \
-    --steps 5000 \
-    --eval-every 100 --eval-n 1000 \
-    --device cuda:0 \
-    --seed ${SEED} \
-    --run-name fig2_l2sq_seed${SEED}
-done
-
-python toy/plot_w2_meanstd.py \
-  --runs-glob 'runs/*fig2_l2sq_seed*' \
-  --targets '8-Gaussians,Checkerboard' \
-  --methods 'one-sided,two-sided,sinkhorn' \
-  --eps-list '0.01,0.05,0.1' \
-  --eps-descending \
-  --right-ylabel \
-  --legend-subplot-col 1 \
-  --title 'Mean ± std over 5 random seeds' \
-  --fig-width-in 6.8 --fig-height-in 7.2 \
-  --out-pdf figures/fig2_w2_meanstd.pdf \
-  --out-png figures/fig2_w2_meanstd.png
-```
-
-Appendix toy figures can be generated by changing:
-
-- `--targets Moons,Spiral`
-- `--dist-metric l2` for the Laplacian-kernel experiments
-- `--dist-metric l2_sq` for the Gaussian-kernel experiments
-
----
----
-
-## Installation
-
-```bash
-git clone https://github.com/mint-vu/sinkhorn_drift.git
-cd sinkhorn_drift
-pip install -e .
+imagenet/                  # ImageNet-256 experiments (main focus)
+├── dit.py                 # LightningDiT (drifting-aligned architecture)
+├── train_drifting.py      # Training loop + sinkhorn drift loss
+├── eval_fid.py            # FID evaluation (InceptionV3)
+├── latent_encoder.py      # ConvNet feature encoder (Appendix A.5)
+├── conv_generator.py      # Conv baseline generator
+├── flow_gen.py            # Flow-mode ablation
+├── cache_latents.py       # VAE latent cache builder
+├── models.py              # Model definitions
+├── sample_decode.py       # RGB decoding utilities
+└── unet.py                # UNet baseline
+core/                      # Core drift loss implementations
+├── drifting_loss.py       # Baseline + Sinkhorn drift loss
+└── models/ema.py          # EMA helper
+scripts/
+├── train_sinkhorn_aligned.sh  # Launch script for aligned training
+├── train_drift_80ep_5kipe.sh  # Original drift training
+└── train_flow_80ep_5kipe.sh   # Flow ablation training
+toy/                       # Toy experiments (Section 5.2)
+mnist/                     # MNIST experiments (Section 5.3)
+ffhq/                      # FFHQ experiments (Section 5.4)
 ```
 
 ---
 
-## MNIST Experiments (Section 5.3)
+## Citation
 
-### 1. Train Autoencoder
-```bash
-python -m mnist.train_ae --run-name mnist_ae
-```
+If you use this code, please cite:
 
-### 2. Precompute Test Latents
-```bash
-python -m mnist.encode_latents --ae-ckpt runs/mnist_ae/<run>/ae_final.pt
-```
-
-### 3. Train Generators (τ sweep, Gaussian kernel)
-
-The following commands reproduce Table 1. Each τ value uses a fixed run name tag
-(e.g. `tau0p005` for τ=0.005) to avoid shell floating-point formatting issues.
-
-```bash
-AE_CKPT=runs/mnist_ae/<run>/ae_final.pt
-
-COMMON="--ae-ckpt $AE_CKPT \
-        --nneg 64 --npos 64 --nuncond 16 --steps 5000 \
-        --lr 0.0002 --weight-decay 0.01 \
-        --warmup-steps 750 --grad-clip 2.0 --ema-decay 0.999 \
-        --omega-min 1.0 --omega-max 4.0 --omega-exponent 3.0 \
-        --dist-metric l2_sq --seed 0"
-
-# Baseline
-for tag_rho in "tau0p005 0.005" "tau0p01 0.01" "tau0p02 0.02" "tau0p025 0.025" \
-               "tau0p03 0.03" "tau0p04 0.04" "tau0p05 0.05" "tau0p1 0.1"; do
-    tag=$(echo $tag_rho | cut -d' ' -f1)
-    rho=$(echo $tag_rho | cut -d' ' -f2)
-    python -m mnist.train_drifting $COMMON \
-        --coupling partial_two_sided --drift-form alg2_joint \
-        --sinkhorn-marginal none \
-        --temps $rho --run-name mnist_baseline_${tag}_l2sq
-done
-
-# Sinkhorn
-for tag_rho in "tau0p005 0.005" "tau0p01 0.01" "tau0p02 0.02" "tau0p025 0.025" \
-               "tau0p03 0.03" "tau0p04 0.04" "tau0p05 0.05" "tau0p1 0.1"; do
-    tag=$(echo $tag_rho | cut -d' ' -f1)
-    rho=$(echo $tag_rho | cut -d' ' -f2)
-    python -m mnist.train_drifting $COMMON \
-        --coupling sinkhorn --drift-form split \
-        --sinkhorn-iters 20 --sinkhorn-marginal weighted_cols \
-        --temps $rho --run-name mnist_sinkhorn_${tag}_l2sq
-done
-```
-
-### 4. Evaluate (W₂² and Accuracy)
-```bash
-AE_CKPT=runs/mnist_ae/<run>/ae_final.pt
-
-for tag in tau0p005 tau0p01 tau0p02 tau0p025 tau0p03 tau0p04 tau0p05 tau0p1; do
-    for method in baseline sinkhorn; do
-        python -m mnist.eval_emd \
-            --gen-ckpt runs/mnist_drift/mnist_${method}_${tag}_l2sq/ckpt_final.pt \
-            --ae-ckpt $AE_CKPT --omega 1.0 --data-root ./data
-        python -m mnist.eval_acc \
-            --gen-ckpt runs/mnist_drift/mnist_${method}_${tag}_l2sq/ckpt_final.pt \
-            --ae-ckpt $AE_CKPT --omega 1.0 --data-root ./data
-    done
-done
-```
-
-### 5. Train Generators (τ sweep, Laplacian kernel — Appendix)
-
-```bash
-AE_CKPT=runs/mnist_ae/<run>/ae_final.pt
-
-COMMON_LAP="--ae-ckpt $AE_CKPT \
-        --nneg 64 --npos 64 --nuncond 16 --steps 5000 \
-        --lr 0.0002 --weight-decay 0.01 \
-        --warmup-steps 750 --grad-clip 2.0 --ema-decay 0.999 \
-        --omega-min 1.0 --omega-max 4.0 --omega-exponent 3.0 \
-        --dist-metric l2 --seed 0"
-
-# Baseline (Laplacian)
-for tag_rho in "tau0p005 0.005" "tau0p01 0.01" "tau0p02 0.02" "tau0p025 0.025" \
-               "tau0p03 0.03" "tau0p04 0.04" "tau0p05 0.05" "tau0p1 0.1"; do
-    tag=$(echo $tag_rho | cut -d' ' -f1)
-    rho=$(echo $tag_rho | cut -d' ' -f2)
-    python -m mnist.train_drifting $COMMON_LAP \
-        --coupling partial_two_sided --drift-form alg2_joint \
-        --sinkhorn-marginal none \
-        --temps $rho --run-name mnist_baseline_${tag}
-done
-
-# Sinkhorn (Laplacian)
-for tag_rho in "tau0p005 0.005" "tau0p01 0.01" "tau0p02 0.02" "tau0p025 0.025" \
-               "tau0p03 0.03" "tau0p04 0.04" "tau0p05 0.05" "tau0p1 0.1"; do
-    tag=$(echo $tag_rho | cut -d' ' -f1)
-    rho=$(echo $tag_rho | cut -d' ' -f2)
-    python -m mnist.train_drifting $COMMON_LAP \
-        --coupling sinkhorn --drift-form split \
-        --sinkhorn-iters 20 --sinkhorn-marginal weighted_cols \
-        --temps $rho --run-name mnist_sinkhorn_${tag}
-done
-```
-
-### 6. Generate Figures
-```bash
-# Gaussian kernel figure (mnist_gaussian.pdf)
-python -m mnist.make_figure \
-    --ae-ckpt runs/mnist_ae/<run>/ae_final.pt \
-    --out figures/mnist_gaussian.pdf --kernel gaussian
-
-# Laplacian kernel figure (mnist_laplacian.pdf)
-python -m mnist.make_figure \
-    --ae-ckpt runs/mnist_ae/<run>/ae_final.pt \
-    --out figures/mnist_laplacian.pdf --kernel laplacian
+```bibtex
+@article{deng2026generative,
+  title={Generative Modeling via Drifting},
+  author={Deng, Mingyang and Li, He and Li, Tianhong and Du, Yilun and He, Kaiming},
+  journal={arXiv preprint arXiv:2602.04770},
+  year={2026}
+}
 ```
 
 ---
 
+## Acknowledgements
 
-## FFHQ Experiments (Section 5.4, Table 2 only)
-
-This repository includes the code needed to reproduce the quantitative FFHQ
-results in Table 2: latent EMD and image FID for baseline vs. Sinkhorn across
-\(\tau \in \{0.1, 1.0, 10.0\}\).
-
-### Data format
-
-The FFHQ pipeline expects latent datasets stored as `.npz` files with exactly
-the following six keys:
-
-- `male_children`
-- `male_adult`
-- `male_old`
-- `female_children`
-- `female_adult`
-- `female_old`
-
-Each value should be a float array of shape `(N_c, 512)`, where `512` is the
-ALAE latent dimension. A typical layout is:
-
-```text
-data/
-└── ffhq_latents_6class/
-    ├── train_latents_by_class.npz
-    └── test_latents_by_class.npz
-```
-
-The training script uses:
-
-- `train_latents_by_class.npz` as the class-specific target pools
-- `test_latents_by_class.npz` for periodic EMD monitoring during training
-
-### External ALAE dependency
-
-Image FID in Table 2 is computed after decoding latents with the same frozen
-ALAE decoder used in the paper. This decoder is **not** bundled in this
-repository. You must provide an external ALAE checkout that contains:
-
-- `alae_ffhq_inference.py`
-- `configs/ffhq.yaml`
-- `training_artifacts/ffhq/`
-
-Set:
-
-```bash
-export ALAE_ROOT=/path/to/ALAE
-```
-
-or pass `--alae-root /path/to/ALAE` to the evaluation script.
-
-### Train the six FFHQ models used in Table 2
-
-Common settings from the paper:
-
-- architecture: `d_z=512`, `d_e=64`, `hidden=1024`, `n_hidden=3`
-- training: `iters=1000`, `batch_size=4096`, `lr=3e-4`, `emb_lr=1e-3`
-- drift: `dist=l2_sq`, `sinkhorn_iters=30`
-- logging/eval: `emd_every=50`, `emd_samples=512`, `log_every=50`
-- seed: `42`
-
-```bash
-TRAIN_NPZ=data/ffhq_latents_6class/train_latents_by_class.npz
-TEST_NPZ=data/ffhq_latents_6class/test_latents_by_class.npz
-
-for EPS in 0.1 1.0 10.0; do
-  TAG=$(echo "$EPS" | tr '.' 'p')
-
-  python -m ffhq.drift_ffhq \
-    --train-npz $TRAIN_NPZ \
-    --test-npz $TEST_NPZ \
-    --save-path runs/ffhq/eps_${TAG}_baseline/drift_ffhq_model.pt \
-    --emd-plot runs/ffhq/eps_${TAG}_baseline/drift_ffhq_emd.png \
-    --emd-perclass-plot runs/ffhq/eps_${TAG}_baseline/drift_ffhq_emd_perclass.png \
-    --pca-plot runs/ffhq/eps_${TAG}_baseline/drift_ffhq_pca.png \
-    --d-z 512 --d-e 64 --hidden 1024 --n-hidden 3 \
-    --iters 1000 --batch-size 4096 --lr 3e-4 --emb-lr 1e-3 \
-    --plan two-sided --eps $EPS --sinkhorn-iters 30 --dist l2_sq \
-    --emd-every 50 --emd-samples 512 --log-every 50 \
-    --seed 42
-
-  python -m ffhq.drift_ffhq \
-    --train-npz $TRAIN_NPZ \
-    --test-npz $TEST_NPZ \
-    --save-path runs/ffhq/eps_${TAG}_sinkhorn/drift_ffhq_model.pt \
-    --emd-plot runs/ffhq/eps_${TAG}_sinkhorn/drift_ffhq_emd.png \
-    --emd-perclass-plot runs/ffhq/eps_${TAG}_sinkhorn/drift_ffhq_emd_perclass.png \
-    --pca-plot runs/ffhq/eps_${TAG}_sinkhorn/drift_ffhq_pca.png \
-    --d-z 512 --d-e 64 --hidden 1024 --n-hidden 3 \
-    --iters 1000 --batch-size 4096 --lr 3e-4 --emb-lr 1e-3 \
-    --plan sinkhorn --eps $EPS --sinkhorn-iters 30 --dist l2_sq \
-    --emd-every 50 --emd-samples 512 --log-every 50 \
-    --seed 42
-done
-```
-
-### Evaluate Table 2 metrics
-
-Table 2 reports:
-
-- latent EMD (`solver=emd`, `metric=l2_sq`)
-- image FID after ALAE decoding at `1024 x 1024`
-
-The evaluation uses `1000` real and `1000` generated samples per class.
-
-```bash
-TRAIN_NPZ=data/ffhq_latents_6class/train_latents_by_class.npz
-
-for EPS in 0.1 1.0 10.0; do
-  TAG=$(echo "$EPS" | tr '.' 'p')
-
-  python -m ffhq.eval_ckpt_fid_emd \
-    --ckpt-path runs/ffhq/eps_${TAG}_baseline/drift_ffhq_model.pt \
-    --real-npz $TRAIN_NPZ \
-    --n-per-class 1000 \
-    --seed 42 \
-    --device cuda:0 \
-    --gen-batch 512 \
-    --decode-batch 8 \
-    --decode-impl batch \
-    --fid-batch 64 \
-    --save-size 1024 \
-    --solver emd \
-    --metric l2_sq \
-    --ot-iters 200000 \
-    --alae-root $ALAE_ROOT \
-    --output-dir runs/ffhq/eps_${TAG}_baseline/eval_table2
-
-  python -m ffhq.eval_ckpt_fid_emd \
-    --ckpt-path runs/ffhq/eps_${TAG}_sinkhorn/drift_ffhq_model.pt \
-    --real-npz $TRAIN_NPZ \
-    --n-per-class 1000 \
-    --seed 42 \
-    --device cuda:0 \
-    --gen-batch 512 \
-    --decode-batch 8 \
-    --decode-impl batch \
-    --fid-batch 64 \
-    --save-size 1024 \
-    --solver emd \
-    --metric l2_sq \
-    --ot-iters 200000 \
-    --alae-root $ALAE_ROOT \
-    --output-dir runs/ffhq/eps_${TAG}_sinkhorn/eval_table2
-done
-```
-
-Each evaluation directory will contain:
-
-- `metrics_fid_emd.json`
-- `sampled_latents_by_class.npz`
-- `real_images/<class>/`
-- `fake_images/<class>/`
-
-The paper numbers are the mean of the six per-class values in each
-`metrics_fid_emd.json`.
-
----
-
-## Pretrained Checkpoints (MNIST)
-
-Pretrained checkpoints are included in `pretrained/`. The directory structure is:
-
-```
-pretrained/
-├── ae/
-│   └── ae_final.pt                   # Autoencoder (latent_dim=6, trained 50 epochs)
-├── mnist_gaussian/                   # Table 1 — Gaussian kernel 
-└── mnist_laplacian/                  # Appendix Table 3 — Laplacian kernel
-```
+This codebase builds on the official [Drifting JAX release](https://github.com/lambertae/drifting) and extends it with Sinkhorn optimal transport couplings.
